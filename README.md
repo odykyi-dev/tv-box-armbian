@@ -209,16 +209,54 @@ mount | grep mmcblk2
 
 ---
 
-## Крок 7: Підводний камінь — SD карта залишається назавжди
+## Крок 7: Запуск з eMMC (без SD карти)
 
-На більшості no-name H3 боксів ROM завжди шукає U-Boot спочатку на SD карті. Без неї бокс не завантажується.
+Спочатку здавалось що SD карта залишається назавжди — але це було через неправильний U-Boot пакет.
 
-Спроби записати U-Boot на eMMC через `dd` або `armbian-install` не дали результату — це апаратне обмеження конкретного боксу. Я пробував також перенести U-Boot на іншу SD карту меншого розміру, але в мене це не вийшло.
+### Причина проблеми
 
-Фінальна конфігурація:
+Образ Orange Pi PC встановлює U-Boot пакет `linux-u-boot-orangepipc-current`. Цей пакет призначений для Orange Pi PC, яка **не має eMMC**. Тому U-Boot SPL не знає як ініціалізувати eMMC і при спробі завантаження без SD видає:
+
 ```
-SD карта (128MB+) → U-Boot (завантажувач)
-eMMC (14.4 ГБ)    → Linux система
+Trying to boot from MMC2
+MMC Device 1 not found
+spl: could not find mmc device 1. error: -19
+SPL: failed to boot from all boot devices
+### ERROR ### Please RESET the board ###
+```
+
+### Рішення
+
+Потрібно встановити U-Boot для **Orange Pi PC Plus** — вона має eMMC і відповідний U-Boot з підтримкою eMMC.
+
+```bash
+# 1. Встановити правильний U-Boot пакет
+sudo apt install linux-u-boot-orangepipcplus-current
+
+# 2. Знайти новий бінарник
+ls /usr/lib/linux-u-boot-current-orangepipcplus/
+
+# 3. Записати на eMMC
+sudo dd if=/usr/lib/linux-u-boot-current-orangepipcplus/u-boot-sunxi-with-spl.bin of=/dev/mmcblk2 bs=1024 seek=8
+
+# 4. Перевірити запис
+sudo dd if=/dev/mmcblk2 bs=1024 skip=8 count=64 2>/dev/null | xxd | head -5
+
+# 5. Вимкнути, витягти SD карту, увімкнути
+sudo shutdown now
+# Витягніть SD карту → подайте живлення
+```
+
+Якщо все працює — система завантажується з eMMC без SD карти.
+
+> ⚠️ **Важливо:** після успішної міграції **обов'язково витягніть SD карту** зі слота. Якщо залишити SD карту в пристрої, Allwinner ROM завантажить U-Boot з неї, і під час оновлення ядра виникне невідповідність: новий kernel встановиться на eMMC, але завантажиться старий з SD карти. Саме це призводить до відсутності модулів (наприклад `overlay`) і поломки Docker.
+
+> ⚠️ **Примітка:** повідомлення "Failed to set core voltage! Can't set CPU frequency" — не критичне. Це U-Boot не може керувати PMIC цього конкретного боксу. CPU працює на стандартній частоті, система працює нормально.
+
+### Фінальна конфігурація
+
+```
+eMMC (16 ГБ) → U-Boot + Linux система (повністю автономно)
 ```
 
 ---
@@ -237,6 +275,46 @@ eMMC (14.4 ГБ)    → Linux система
 
 **Висновок:** уникайте `armbian-update` на цьому пристрої — це призведе до невідповідності ядра і пакетів.
 
+> ⚠️ **Додатково:** після міграції на eMMC обов'язково витягніть SD карту. Залишена SD карта може стати причиною такого ж skew під час оновлення: нові пакети встановляться на eMMC, але завантажиться старе ядро з SD.
+
+---
+
+## Додаток: Docker та Klipper/Moonraker
+
+### Встановлення Docker
+
+```bash
+# Додати репозиторій Docker
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-compose-plugin
+```
+
+### Виправлення nftables
+
+На ядрах 6.18+ Docker не запускається через nftables:
+
+```bash
+sudo tee /etc/docker/daemon.json << 'EOF'
+{
+  "firewall-backend": "nftables"
+}
+EOF
+
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo systemctl restart docker
+sudo docker run hello-world
+```
+
+### Встановлення Klipper + Moonraker + Mainsail
+
+Див. Ansible роль `roles/klipper/` в репозиторії `ansible/docker`.
+
 ---
 
 ## Підводні камені — коротко
@@ -247,7 +325,9 @@ eMMC (14.4 ГБ)    → Linux система
 | Не завантажується з SD | eMMC має пріоритет | Reset trick (зубочистка в AV-отвір) |
 | eMMC не видно | Неправильний DTB | Додати `fdtfile=sun8i-h3-orangepi-pc-plus.dtb` |
 | Read-only filesystem | Погана SD карта | Замінити SD або робити fsck з іншого ПК |
-| Без SD не завантажується | Апаратне обмеження | Залишити маленьку SD назавжди |
+| Без SD не завантажується | Неправильний U-Boot (orangepipc замість orangepipcplus) | `sudo apt install linux-u-boot-orangepipcplus-current` + `dd` на eMMC |
+| Залишена SD карта після міграції | U-Boot завантажує старе ядро з SD, нові пакети вимагають нового ядра | Витягнути SD карту після переходу на eMMC |
+| Docker nftables помилка | Старе ядро без netfilter | Оновити ядро до 6.18.35+, `firewall-backend: nftables` |
 | Docker образи не знаходяться | ARM 32-bit | Шукати тег `linux/arm/v7` |
 | Після armbian-update ядро не оновилось | U-Boot читає старий boot.scr з SD | Перевстановити з нуля з новим образом |
 
@@ -255,7 +335,9 @@ eMMC (14.4 ГБ)    → Linux система
 
 ## Висновок
 
-TV приставка OzoneHD Nexo на Allwinner H3 цілком придатна для домашнього Linux сервера. Зараз вона у мене обслуговує два поверхи будинку через два інстанси Zigbee2MQTT і Apache Mosquitto — все в Docker, стабільно працює.
+TV приставка OzoneHD Nexo на Allwinner H3 цілком придатна для домашнього Linux сервера. Після встановлення правильного U-Boot (`orangepipcplus` замість `orangepipc`) система завантажується безпосередньо з eMMC — SD карта більше не потрібна.
+
+Зараз вона обслуговує Klipper (3D-принтер Sovol SV01 Pro), Docker, Mosquitto MQTT — все стабільно працює на ядрі 6.18.35.
 
 Процес непростий — але реальний. Головне не здаватись якщо щось не працює з першого разу.
 
